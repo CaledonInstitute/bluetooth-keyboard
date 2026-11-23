@@ -1,0 +1,101 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+new file mode 100644
+index 0000000..5800642
+--- /dev/null
++++ b/.github/workflows/release.yml
+@@ -0,0 +1,83 @@
++name: Build and Release Android APK
++
++on:
++  # Push a tag like v1.0.0 to build and publish a GitHub Release.
++  push:
++    tags:
++      - "v*"
++  # Manual run from the Actions tab: builds the APK and uploads it as an
++  # artifact, but does not create a release.
++  workflow_dispatch:
++
++permissions:
++  contents: write
++
++concurrency:
++  group: release-${{ github.ref }}
++  cancel-in-progress: false
++
++env:
++  CI: "1"
++  # ABIs to include in the APK. Add x86_64 / x86 if you need emulator support.
++  ABIS: arm64-v8a,armeabi-v7a
++
++jobs:
++  build:
++    name: Build APK
++    runs-on: ubuntu-latest
++    timeout-minutes: 60
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: npm
++
++      - name: Setup Java
++        uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: 17
++
++      - name: Setup Gradle (cache)
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Install dependencies
++        run: npm ci
++
++      # android/ is generated (Continuous Native Generation) and git-ignored.
++      - name: Generate native Android project
++        run: npx expo prebuild --platform android --no-install
++
++      - name: Build release APK
++        working-directory: android
++        run: ./gradlew assembleRelease -PreactNativeArchitectures="$ABIS" --no-daemon
++
++      - name: Name the APK
++        id: apk
++        run: |
++          VERSION="${GITHUB_REF_NAME}"
++          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
++            VERSION="dev-${GITHUB_SHA::7}"
++          fi
++          NAME="bluetooth-keyboard-${VERSION}.apk"
++          cp android/app/build/outputs/apk/release/app-release.apk "$NAME"
++          echo "name=$NAME" >> "$GITHUB_OUTPUT"
++
++      - name: Upload APK artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: ${{ steps.apk.outputs.name }}
++          path: ${{ steps.apk.outputs.name }}
++          if-no-files-found: error
++
++      - name: Publish GitHub Release
++        if: startsWith(github.ref, 'refs/tags/')
++        uses: softprops/action-gh-release@v2
++        with:
++          files: ${{ steps.apk.outputs.name }}
++          generate_release_notes: true
+diff --git a/app.json b/app.json
+index fc1e7cc..913f577 100644
+--- a/app.json
++++ b/app.json
+@@ -11,6 +11,7 @@
+       "icon": "./assets/expo.icon"
+     },
+     "android": {
++      "package": "com.bluetoothkeyboard.app",
+       "adaptiveIcon": {
+         "backgroundColor": "#E6F4FE",
+         "foregroundImage": "./assets/images/android-icon-foreground.png",
