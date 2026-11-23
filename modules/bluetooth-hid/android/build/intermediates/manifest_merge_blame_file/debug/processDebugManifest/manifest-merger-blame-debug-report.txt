@@ -1,0 +1,38 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="expo.modules.bluetoothhid" >
+4
+5    <uses-sdk android:minSdkVersion="24" />
+5-->INJECTED
+5-->INJECTED
+6
+7    <uses-feature
+7-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:3-85
+8        android:name="android.hardware.bluetooth"
+8-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:17-58
+9        android:required="true" />
+9-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:59-82
+10
+11    <!-- Android 11 ke bawah -->
+12    <uses-permission
+12-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:3-93
+13        android:name="android.permission.BLUETOOTH"
+13-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:20-63
+14        android:maxSdkVersion="30" />
+14-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:64-90
+15    <uses-permission
+15-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:3-99
+16        android:name="android.permission.BLUETOOTH_ADMIN"
+16-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:20-69
+17        android:maxSdkVersion="30" />
+17-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:70-96
+18
+19    <!-- Android 12 ke atas ("Perangkat sekitar") -->
+20    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+20-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:9:3-74
+20-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:9:20-71
+21    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+21-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:10:3-76
+21-->C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:10:20-73
+22
+23</manifest>

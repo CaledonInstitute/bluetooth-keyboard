@@ -1,0 +1,42 @@
+-- Merging decision tree log ---
+manifest
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:1:1-11:12
+INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:1:1-11:12
+	package
+		INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml
+	xmlns:android
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:1:11-69
+uses-feature#android.hardware.bluetooth
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:3-85
+	android:required
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:59-82
+	android:name
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:2:17-58
+uses-permission#android.permission.BLUETOOTH
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:3-93
+	android:maxSdkVersion
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:64-90
+	android:name
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:5:20-63
+uses-permission#android.permission.BLUETOOTH_ADMIN
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:3-99
+	android:maxSdkVersion
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:70-96
+	android:name
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:6:20-69
+uses-permission#android.permission.BLUETOOTH_CONNECT
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:9:3-74
+	android:name
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:9:20-71
+uses-permission#android.permission.BLUETOOTH_ADVERTISE
+ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:10:3-76
+	android:name
+		ADDED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml:10:20-73
+uses-sdk
+INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml
+INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from C:\Users\Andika\Desktop\Projects\bluetooth-keyboard\modules\bluetooth-hid\android\src\main\AndroidManifest.xml
