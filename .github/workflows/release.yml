@@ -55,7 +55,7 @@ jobs:
 
       - name: Build release APK
         working-directory: android
-        run: ./gradlew assembleRelease -PreactNativeArchitectures="$ABIS" --no-daemon
+        run: ./gradlew assembleRelease -PreactNativeArchitectures="$ABIS" --no-daemon --stacktrace
 
       - name: Name the APK
         id: apk
