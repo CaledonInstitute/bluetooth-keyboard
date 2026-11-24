@@ -1,0 +1,1119 @@
+diff --git a/modules/bluetooth-hid/android/src/main/AndroidManifest.xml b/modules/bluetooth-hid/android/src/main/AndroidManifest.xml
+index 9716003..33f9e4e 100644
+--- a/modules/bluetooth-hid/android/src/main/AndroidManifest.xml
++++ b/modules/bluetooth-hid/android/src/main/AndroidManifest.xml
+@@ -1,5 +1,6 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+   <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
++  <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+ 
+   <!-- Android 11 ke bawah -->
+   <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+diff --git a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BleHidKeyboard.kt b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BleHidKeyboard.kt
+new file mode 100644
+index 0000000..c1483ba
+--- /dev/null
++++ b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BleHidKeyboard.kt
+@@ -0,0 +1,499 @@
++package expo.modules.bluetoothhid
++
++import android.annotation.SuppressLint
++import android.bluetooth.BluetoothAdapter
++import android.bluetooth.BluetoothDevice
++import android.bluetooth.BluetoothGatt
++import android.bluetooth.BluetoothGattCharacteristic
++import android.bluetooth.BluetoothGattDescriptor
++import android.bluetooth.BluetoothGattServer
++import android.bluetooth.BluetoothGattServerCallback
++import android.bluetooth.BluetoothGattService
++import android.bluetooth.BluetoothManager
++import android.bluetooth.BluetoothProfile
++import android.bluetooth.BluetoothStatusCodes
++import android.bluetooth.le.AdvertiseCallback
++import android.bluetooth.le.AdvertiseData
++import android.bluetooth.le.AdvertiseSettings
++import android.bluetooth.le.BluetoothLeAdvertiser
++import android.content.Context
++import android.os.Build
++import android.os.ParcelUuid
++import java.util.UUID
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.ExecutorService
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++/**
++ * Membuat HP berperan sebagai keyboard Bluetooth Low Energy (HID over GATT, HOGP).
++ *
++ * Dipakai sebagai cadangan kalau profil HID Device klasik tidak tersedia: Android 8 ke bawah,
++ * atau HP yang memblokir profil itu. Tidak butuh Android 9, cukup Android 5 dengan dukungan
++ * BLE peripheral. Laptop harus punya Bluetooth LE (Windows 10/11 sudah mendukung).
++ *
++ * Izin BLUETOOTH_CONNECT dan BLUETOOTH_ADVERTISE (Android 12+) harus sudah diberikan.
++ */
++@SuppressLint("MissingPermission")
++class BleHidKeyboard(
++  private val context: Context,
++  private val onState: (status: String, device: BluetoothDevice?) -> Unit,
++) {
++  private val manager: BluetoothManager? =
++    context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
++  private val adapter: BluetoothAdapter? = manager?.adapter
++
++  private val sendExecutor: ExecutorService = Executors.newSingleThreadExecutor()
++  private val pending = mutableListOf<BluetoothGattService>()
++
++  @Volatile private var server: BluetoothGattServer? = null
++  @Volatile private var advertiser: BluetoothLeAdvertiser? = null
++  @Volatile private var inputReport: BluetoothGattCharacteristic? = null
++  @Volatile private var outputReport: BluetoothGattCharacteristic? = null
++  @Volatile private var host: BluetoothDevice? = null
++  @Volatile private var subscribed = false
++  @Volatile private var advertising = false
++  @Volatile private var sentLatch: CountDownLatch? = null
++  @Volatile private var currentStatus = "stopped"
++
++  private val gattCallback = object : BluetoothGattServerCallback() {
++    override fun onServiceAdded(gattStatus: Int, service: BluetoothGattService) {
++      if (gattStatus != BluetoothGatt.GATT_SUCCESS || !addNextService()) {
++        update("failed", null)
++      }
++    }
++
++    override fun onConnectionStateChange(device: BluetoothDevice, gattStatus: Int, newState: Int) {
++      when (newState) {
++        BluetoothProfile.STATE_CONNECTED -> {
++          host = device
++          subscribed = false
++          stopAdvertising()
++          update("connecting", device)
++        }
++        BluetoothProfile.STATE_DISCONNECTED -> {
++          val current = host
++          if (current == null || current.address == device.address) {
++            host = null
++            subscribed = false
++            update("ready", null)
++            startAdvertising()
++          }
++        }
++      }
++    }
++
++    override fun onCharacteristicReadRequest(
++      device: BluetoothDevice,
++      requestId: Int,
++      offset: Int,
++      characteristic: BluetoothGattCharacteristic,
++    ) {
++      respondToRead(device, requestId, offset, characteristicValue(characteristic))
++    }
++
++    override fun onDescriptorReadRequest(
++      device: BluetoothDevice,
++      requestId: Int,
++      offset: Int,
++      descriptor: BluetoothGattDescriptor,
++    ) {
++      val isInput = descriptor.characteristic === inputReport
++      val value: ByteArray? = when (descriptor.uuid) {
++        DESC_CCCD ->
++          if (isInput && subscribed) byteArrayOf(0x01, 0x00) else byteArrayOf(0x00, 0x00)
++        DESC_REPORT_REFERENCE ->
++          byteArrayOf(HidDescriptor.REPORT_ID.toByte(), (if (isInput) 1 else 2).toByte())
++        else -> null
++      }
++      respondToRead(device, requestId, offset, value)
++    }
++
++    override fun onCharacteristicWriteRequest(
++      device: BluetoothDevice,
++      requestId: Int,
++      characteristic: BluetoothGattCharacteristic,
++      preparedWrite: Boolean,
++      responseNeeded: Boolean,
++      offset: Int,
++      value: ByteArray?,
++    ) {
++      // Protocol Mode, Control Point, dan LED report diterima saja, tidak ada yang perlu diproses.
++      if (responseNeeded) {
++        server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
++      }
++    }
++
++    override fun onDescriptorWriteRequest(
++      device: BluetoothDevice,
++      requestId: Int,
++      descriptor: BluetoothGattDescriptor,
++      preparedWrite: Boolean,
++      responseNeeded: Boolean,
++      offset: Int,
++      value: ByteArray?,
++    ) {
++      var result = BluetoothGatt.GATT_SUCCESS
++      if (descriptor.uuid == DESC_CCCD) {
++        if (descriptor.characteristic === inputReport) {
++          val enabled = value != null && value.isNotEmpty() && (value[0].toInt() and 0x01) != 0
++          if (host == null) host = device
++          subscribed = enabled
++          // Laptop baru dianggap terhubung setelah ia berlangganan notifikasi keyboard.
++          update(if (enabled) "connected" else "connecting", host)
++        }
++      } else {
++        result = BluetoothGatt.GATT_WRITE_NOT_PERMITTED
++      }
++      if (responseNeeded) {
++        server?.sendResponse(device, requestId, result, offset, value)
++      }
++    }
++
++    override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
++      server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
++    }
++
++    override fun onNotificationSent(device: BluetoothDevice, gattStatus: Int) {
++      sentLatch?.countDown()
++    }
++  }
++
++  private val advertiseCallback = object : AdvertiseCallback() {
++    override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
++      if (host == null) update("ready", null)
++    }
++
++    override fun onStartFailure(errorCode: Int) {
++      if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) {
++        if (host == null) update("ready", null)
++      } else {
++        advertising = false
++        update("failed", null)
++      }
++    }
++  }
++
++  private fun update(newStatus: String, device: BluetoothDevice?) {
++    currentStatus = newStatus
++    onState(newStatus, device)
++  }
++
++  /** Mengembalikan "ok", "no_bluetooth", "bluetooth_off", "unsupported", "permission", atau "failed". */
++  fun start(): String {
++    val bt = adapter ?: return "no_bluetooth"
++    if (!bt.isEnabled) return "bluetooth_off"
++
++    if (server != null) {
++      // Sudah berjalan, kirim ulang status terakhir ke JS.
++      update(currentStatus, host)
++      return "ok"
++    }
++
++    return try {
++      // Null kalau chipset HP tidak bisa menjadi BLE peripheral.
++      val adv = bt.bluetoothLeAdvertiser ?: return "unsupported"
++      val srv = manager?.openGattServer(context, gattCallback) ?: return "failed"
++      advertiser = adv
++      server = srv
++
++      update("starting", null)
++      synchronized(pending) {
++        pending.clear()
++        pending.addAll(buildServices())
++      }
++      if (addNextService()) {
++        "ok"
++      } else {
++        stop()
++        update("failed", null)
++        "failed"
++      }
++    } catch (e: SecurityException) {
++      stop()
++      "permission"
++    }
++  }
++
++  fun stop() {
++    runCatching { stopAdvertising() }
++    runCatching { server?.close() }
++    server = null
++    advertiser = null
++    inputReport = null
++    outputReport = null
++    host = null
++    subscribed = false
++    sentLatch?.countDown()
++    sendExecutor.shutdown()
++  }
++
++  /** Daftar perangkat yang sudah dipasangkan, dalam bentuk JSON array. */
++  fun pairedDevicesJson(): String = bondedDevicesJson(adapter)
++
++  /** Pada BLE, laptoplah yang biasanya menyambung. Ini hanya mencoba menyambung ke laptop yang sudah dipasangkan. */
++  fun connect(address: String): Boolean {
++    val srv = server ?: return false
++    val bt = adapter ?: return false
++    if (host != null) return false
++
++    val target = try {
++      bt.getRemoteDevice(address)
++    } catch (e: IllegalArgumentException) {
++      return false
++    }
++    return try {
++      srv.connect(target, false)
++    } catch (e: Exception) {
++      false
++    }
++  }
++
++  fun disconnect() {
++    val current = host ?: return
++    runCatching { server?.cancelConnection(current) }
++  }
++
++  /**
++   * Menerima pasangan flat [modifier, usage, modifier, usage, ...].
++   * Setiap pasangan dikirim sebagai tekan lalu lepas, berurutan di satu thread.
++   */
++  fun sendKeys(keys: IntArray) {
++    if (host == null || !subscribed) return
++    if (sendExecutor.isShutdown) return
++
++    sendExecutor.execute {
++      var i = 0
++      while (i + 1 < keys.size) {
++        val press = ByteArray(8)
++        press[0] = keys[i].toByte()
++        press[2] = keys[i + 1].toByte()
++
++        if (!notifyReport(press)) return@execute
++        if (!notifyReport(ByteArray(8))) return@execute
++        i += 2
++      }
++    }
++  }
++
++  /** Kirim satu report lalu tunggu sistem selesai mengirimnya, karena notifikasi tidak boleh bertumpuk. */
++  private fun notifyReport(report: ByteArray): Boolean {
++    repeat(NOTIFY_RETRIES) {
++      val srv = server ?: return false
++      val characteristic = inputReport ?: return false
++      val target = host ?: return false
++
++      val latch = CountDownLatch(1)
++      sentLatch = latch
++      if (notifyCompat(srv, target, characteristic, report)) {
++        latch.await(NOTIFY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
++        return true
++      }
++      Thread.sleep(RETRY_DELAY_MS)
++    }
++    return false
++  }
++
++  @Suppress("DEPRECATION")
++  private fun notifyCompat(
++    srv: BluetoothGattServer,
++    device: BluetoothDevice,
++    characteristic: BluetoothGattCharacteristic,
++    value: ByteArray,
++  ): Boolean {
++    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++      srv.notifyCharacteristicChanged(device, characteristic, false, value) ==
++        BluetoothStatusCodes.SUCCESS
++    } else {
++      characteristic.value = value
++      srv.notifyCharacteristicChanged(device, characteristic, false)
++    }
++  }
++
++  private fun respondToRead(device: BluetoothDevice, requestId: Int, offset: Int, value: ByteArray?) {
++    val srv = server ?: return
++    when {
++      value == null ->
++        srv.sendResponse(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, offset, null)
++      offset > value.size ->
++        srv.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
++      else ->
++        srv.sendResponse(
++          device,
++          requestId,
++          BluetoothGatt.GATT_SUCCESS,
++          offset,
++          value.copyOfRange(offset, value.size),
++        )
++    }
++  }
++
++  private fun characteristicValue(characteristic: BluetoothGattCharacteristic): ByteArray? = when {
++    characteristic === inputReport -> ByteArray(8)
++    characteristic === outputReport -> ByteArray(1)
++    characteristic.uuid == CHAR_REPORT_MAP -> HidDescriptor.KEYBOARD
++    characteristic.uuid == CHAR_HID_INFORMATION -> byteArrayOf(0x11, 0x01, 0x00, 0x02)
++    characteristic.uuid == CHAR_PROTOCOL_MODE -> byteArrayOf(0x01)
++    characteristic.uuid == CHAR_BATTERY_LEVEL -> byteArrayOf(100)
++    characteristic.uuid == CHAR_PNP_ID -> byteArrayOf(0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01)
++    characteristic.uuid == CHAR_MANUFACTURER_NAME -> "Android".toByteArray()
++    else -> null
++  }
++
++  /** Service harus ditambahkan satu per satu: service berikutnya menunggu onServiceAdded. */
++  private fun addNextService(): Boolean {
++    val srv = server ?: return false
++    val next = synchronized(pending) { if (pending.isEmpty()) null else pending.removeAt(0) }
++    if (next == null) {
++      startAdvertising()
++      return true
++    }
++    return srv.addService(next)
++  }
++
++  private fun buildServices(): List<BluetoothGattService> {
++    val read = BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED
++    val write = BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED
++    val descRead = BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED
++    val descWrite = BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED
++
++    val battery = BluetoothGattService(SERVICE_BATTERY, BluetoothGattService.SERVICE_TYPE_PRIMARY)
++    battery.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_BATTERY_LEVEL,
++        BluetoothGattCharacteristic.PROPERTY_READ,
++        BluetoothGattCharacteristic.PERMISSION_READ,
++      ),
++    )
++
++    val info = BluetoothGattService(SERVICE_DEVICE_INFO, BluetoothGattService.SERVICE_TYPE_PRIMARY)
++    info.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_MANUFACTURER_NAME,
++        BluetoothGattCharacteristic.PROPERTY_READ,
++        BluetoothGattCharacteristic.PERMISSION_READ,
++      ),
++    )
++    info.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_PNP_ID,
++        BluetoothGattCharacteristic.PROPERTY_READ,
++        BluetoothGattCharacteristic.PERMISSION_READ,
++      ),
++    )
++
++    val input = BluetoothGattCharacteristic(
++      CHAR_REPORT,
++      BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
++      read,
++    )
++    input.addDescriptor(BluetoothGattDescriptor(DESC_CCCD, descRead or descWrite))
++    input.addDescriptor(BluetoothGattDescriptor(DESC_REPORT_REFERENCE, descRead))
++
++    val output = BluetoothGattCharacteristic(
++      CHAR_REPORT,
++      BluetoothGattCharacteristic.PROPERTY_READ or
++        BluetoothGattCharacteristic.PROPERTY_WRITE or
++        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
++      read or write,
++    )
++    output.addDescriptor(BluetoothGattDescriptor(DESC_REPORT_REFERENCE, descRead))
++
++    inputReport = input
++    outputReport = output
++
++    val hid = BluetoothGattService(SERVICE_HID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
++    hid.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_HID_INFORMATION,
++        BluetoothGattCharacteristic.PROPERTY_READ,
++        read,
++      ),
++    )
++    hid.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_REPORT_MAP,
++        BluetoothGattCharacteristic.PROPERTY_READ,
++        read,
++      ),
++    )
++    hid.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_CONTROL_POINT,
++        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
++        write,
++      ),
++    )
++    hid.addCharacteristic(
++      BluetoothGattCharacteristic(
++        CHAR_PROTOCOL_MODE,
++        BluetoothGattCharacteristic.PROPERTY_READ or
++          BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
++        read or write,
++      ),
++    )
++    hid.addCharacteristic(input)
++    hid.addCharacteristic(output)
++
++    return listOf(battery, info, hid)
++  }
++
++  private fun startAdvertising() {
++    val adv = advertiser ?: return
++    if (advertising) return
++
++    val settings = AdvertiseSettings.Builder()
++      .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
++      .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
++      .setConnectable(true)
++      .setTimeout(0)
++      .build()
++    // Paket iklan hanya 31 byte: UUID service HID di iklan, nama HP di scan response.
++    val data = AdvertiseData.Builder()
++      .setIncludeDeviceName(false)
++      .addServiceUuid(ParcelUuid(SERVICE_HID))
++      .build()
++    val scanResponse = AdvertiseData.Builder()
++      .setIncludeDeviceName(true)
++      .build()
++
++    advertising = true
++    try {
++      adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
++    } catch (e: IllegalStateException) {
++      advertising = false
++      update("failed", null)
++    }
++  }
++
++  private fun stopAdvertising() {
++    if (!advertising) return
++    advertising = false
++    runCatching { advertiser?.stopAdvertising(advertiseCallback) }
++  }
++
++  companion object {
++    private const val NOTIFY_TIMEOUT_MS = 100L
++    private const val NOTIFY_RETRIES = 5
++    private const val RETRY_DELAY_MS = 5L
++
++    private fun uuid16(value: Int): UUID =
++      UUID.fromString(String.format("0000%04x-0000-1000-8000-00805f9b34fb", value))
++
++    private val SERVICE_HID = uuid16(0x1812)
++    private val SERVICE_BATTERY = uuid16(0x180F)
++    private val SERVICE_DEVICE_INFO = uuid16(0x180A)
++
++    private val CHAR_HID_INFORMATION = uuid16(0x2A4A)
++    private val CHAR_REPORT_MAP = uuid16(0x2A4B)
++    private val CHAR_CONTROL_POINT = uuid16(0x2A4C)
++    private val CHAR_REPORT = uuid16(0x2A4D)
++    private val CHAR_PROTOCOL_MODE = uuid16(0x2A4E)
++    private val CHAR_BATTERY_LEVEL = uuid16(0x2A19)
++    private val CHAR_MANUFACTURER_NAME = uuid16(0x2A29)
++    private val CHAR_PNP_ID = uuid16(0x2A50)
++
++    private val DESC_CCCD = uuid16(0x2902)
++    private val DESC_REPORT_REFERENCE = uuid16(0x2908)
++  }
++}
+diff --git a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BluetoothHidModule.kt b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BluetoothHidModule.kt
+index bba86fd..426b946 100644
+--- a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BluetoothHidModule.kt
++++ b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/BluetoothHidModule.kt
+@@ -10,15 +10,33 @@ import androidx.core.os.bundleOf
+ import expo.modules.kotlin.modules.Module
+ import expo.modules.kotlin.modules.ModuleDefinition
+ 
++/**
++ * Dua cara menjadi keyboard Bluetooth:
++ * - "classic": profil HID Device klasik (Android 9+), paling kompatibel dengan laptop.
++ * - "ble": HID over GATT (Android 5+ dengan dukungan BLE peripheral), dipakai sebagai cadangan.
++ */
+ class BluetoothHidModule : Module() {
++  private val lock = Any()
+   private var keyboard: HidKeyboard? = null
++  private var ble: BleHidKeyboard? = null
++  private var starting = false
++
++  // Event dari instance lama (yang sudah dihentikan) diabaikan dengan membandingkan nomor ini.
++  @Volatile private var generation = 0
++  @Volatile private var transport = TRANSPORT_CLASSIC
+ 
+   private val context: Context
+     get() = requireNotNull(appContext.reactContext)
+ 
+-  private val supportsHidDevice: Boolean
+-    get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+-      context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH)
++  private val hasBluetooth: Boolean
++    get() = context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH)
++
++  private val classicSupported: Boolean
++    get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasBluetooth
++
++  private val bleSupported: Boolean
++    get() = hasBluetooth &&
++      context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)
+ 
+   override fun definition() = ModuleDefinition {
+     Name("BluetoothHid")
+@@ -26,42 +44,48 @@ class BluetoothHidModule : Module() {
+     Events("onStateChange")
+ 
+     Function("isSupported") {
+-      return@Function supportsHidDevice
++      return@Function classicSupported || bleSupported
+     }
+ 
+-    Function("start") {
+-      if (!supportsHidDevice) return@Function "unsupported"
+-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return@Function "unsupported"
+-
+-      val kb = keyboard ?: HidKeyboard(context) { status, device ->
+-        emitState(status, device)
+-      }.also { keyboard = it }
+-
+-      return@Function kb.start()
++    Function("start") { mode: String ->
++      return@Function synchronized(lock) {
++        stopAll()
++        when {
++          mode == "ble" -> if (bleSupported) startBle() else "unsupported"
++          mode == "classic" -> if (classicSupported) startClassic(allowFallback = false) else "unsupported"
++          classicSupported -> startClassic(allowFallback = bleSupported)
++          bleSupported -> startBle()
++          else -> "unsupported"
++        }
++      }
+     }
+ 
+     Function("stop") {
+-      keyboard?.stop()
+-      keyboard = null
++      synchronized(lock) { stopAll() }
+     }
+ 
+     Function("getPairedDevices") {
+-      return@Function keyboard?.pairedDevicesJson() ?: "[]"
++      return@Function keyboard?.pairedDevicesJson() ?: ble?.pairedDevicesJson() ?: "[]"
+     }
+ 
+     Function("connect") { address: String ->
+-      return@Function keyboard?.connect(address) ?: false
++      return@Function keyboard?.connect(address) ?: ble?.connect(address) ?: false
+     }
+ 
+     Function("disconnect") {
+       keyboard?.disconnect()
++      ble?.disconnect()
+     }
+ 
+     Function("sendKeys") { keys: IntArray ->
+       keyboard?.sendKeys(keys)
++      ble?.sendKeys(keys)
+     }
+ 
+     Function("requestDiscoverable") {
++      // Pada BLE, HP sudah terlihat oleh laptop lewat iklan BLE.
++      if (ble != null) return@Function true
++
+       val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+         .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_SECONDS)
+       return@Function try {
+@@ -79,9 +103,74 @@ class BluetoothHidModule : Module() {
+     }
+ 
+     OnDestroy {
+-      keyboard?.stop()
+-      keyboard = null
++      synchronized(lock) { stopAll() }
++    }
++  }
++
++  private fun stopAll() {
++    generation++
++    keyboard?.stop()
++    keyboard = null
++    ble?.stop()
++    ble = null
++  }
++
++  /** Harus dipanggil di dalam lock. */
++  private fun startClassic(allowFallback: Boolean): String {
++    val token = ++generation
++    transport = TRANSPORT_CLASSIC
++
++    val kb = HidKeyboard(context) { status, device ->
++      if (token == generation) onClassicState(status, device)
++    }
++    keyboard = kb
++
++    starting = true
++    val result = try {
++      kb.start()
++    } finally {
++      starting = false
++    }
++
++    // Gagal langsung, misalnya sistem menolak membuka profil HID Device.
++    if (result == "failed" && allowFallback) {
++      stopAll()
++      return startBle()
++    }
++    return result
++  }
++
++  /** Harus dipanggil di dalam lock. */
++  private fun startBle(): String {
++    val token = ++generation
++    transport = TRANSPORT_BLE
++
++    val k = BleHidKeyboard(context) { status, device ->
++      if (token == generation) emitState(status, device)
++    }
++    ble = k
++
++    val result = k.start()
++    if (result != "ok") {
++      k.stop()
++      ble = null
++    }
++    return result
++  }
++
++  private fun onClassicState(status: String, device: BluetoothDevice?) {
++    // Gagal belakangan, misalnya HP menolak mendaftarkan keyboard. Pindah ke BLE kalau bisa.
++    if (status == "failed" && !starting && bleSupported) {
++      synchronized(lock) {
++        if (keyboard != null) {
++          stopAll()
++          val result = startBle()
++          if (result != "ok") emitState("failed", null)
++        }
++      }
++      return
+     }
++    emitState(status, device)
+   }
+ 
+   private fun emitState(status: String, device: BluetoothDevice?) {
+@@ -94,6 +183,7 @@ class BluetoothHidModule : Module() {
+       "onStateChange",
+       bundleOf(
+         "status" to status,
++        "transport" to transport,
+         "deviceName" to (name ?: device?.address),
+         "deviceAddress" to device?.address,
+       ),
+@@ -102,5 +192,7 @@ class BluetoothHidModule : Module() {
+ 
+   companion object {
+     private const val DISCOVERABLE_SECONDS = 300
++    private const val TRANSPORT_CLASSIC = "classic"
++    private const val TRANSPORT_BLE = "ble"
+   }
+ }
+diff --git a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidKeyboard.kt b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidKeyboard.kt
+index 20bdcf5..eda9bff 100644
+--- a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidKeyboard.kt
++++ b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidKeyboard.kt
+@@ -2,7 +2,6 @@ package expo.modules.bluetoothhid
+ 
+ import android.annotation.SuppressLint
+ import android.bluetooth.BluetoothAdapter
+-import android.bluetooth.BluetoothClass
+ import android.bluetooth.BluetoothDevice
+ import android.bluetooth.BluetoothHidDevice
+ import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+@@ -11,8 +10,6 @@ import android.bluetooth.BluetoothProfile
+ import android.content.Context
+ import android.os.Build
+ import androidx.annotation.RequiresApi
+-import org.json.JSONArray
+-import org.json.JSONObject
+ import java.util.concurrent.ExecutorService
+ import java.util.concurrent.Executors
+ 
+@@ -36,16 +33,19 @@ class HidKeyboard(
+   @Volatile private var hid: BluetoothHidDevice? = null
+   @Volatile private var host: BluetoothDevice? = null
+   @Volatile private var isRegistered = false
++  @Volatile private var everRegistered = false
+   @Volatile private var status = "stopped"
+ 
+   private val callback = object : BluetoothHidDevice.Callback() {
+     override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+       isRegistered = registered
+       if (registered) {
++        everRegistered = true
+         update(if (host != null) "connected" else "ready", host)
+       } else {
+         host = null
+-        update("stopped", null)
++        // Ditolak sebelum sempat terdaftar berarti HP memblokir profil ini, bukan sekadar berhenti.
++        update(if (everRegistered) "stopped" else "failed", null)
+       }
+     }
+ 
+@@ -79,7 +79,7 @@ class HidKeyboard(
+         "Bluetooth keyboard",
+         "Android",
+         BluetoothHidDevice.SUBCLASS1_KEYBOARD,
+-        KEYBOARD_DESCRIPTOR,
++        HidDescriptor.KEYBOARD,
+       )
+       val ok = device.registerApp(sdp, null, null, callbackExecutor, callback)
+       if (!ok) update("failed", null)
+@@ -133,26 +133,7 @@ class HidKeyboard(
+   }
+ 
+   /** Daftar perangkat yang sudah dipasangkan, dalam bentuk JSON array. */
+-  fun pairedDevicesJson(): String {
+-    val result = JSONArray()
+-    val bonded: Set<BluetoothDevice> = try {
+-      adapter?.bondedDevices ?: emptySet()
+-    } catch (e: SecurityException) {
+-      emptySet()
+-    }
+-
+-    for (device in bonded) {
+-      val isComputer =
+-        device.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
+-      result.put(
+-        JSONObject()
+-          .put("name", device.name ?: device.address)
+-          .put("address", device.address)
+-          .put("isComputer", isComputer),
+-      )
+-    }
+-    return result.toString()
+-  }
++  fun pairedDevicesJson(): String = bondedDevicesJson(adapter)
+ 
+   fun connect(address: String): Boolean {
+     val h = hid ?: return false
+@@ -200,51 +181,12 @@ class HidKeyboard(
+   }
+ 
+   companion object {
+-    private const val REPORT_ID = 1
++    private const val REPORT_ID = HidDescriptor.REPORT_ID
+     private const val KEY_DELAY_MS = 4L
+ 
+     /** Dipakai bersama oleh semua instance dan tidak pernah dimatikan. Thread daemon, jadi tidak menahan proses. */
+     private val callbackExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+       Thread(runnable, "bluetooth-hid-callback").apply { isDaemon = true }
+     }
+-
+-    private fun bytes(vararg values: Int) = ByteArray(values.size) { values[it].toByte() }
+-
+-    /** HID report descriptor keyboard standar (report ID 1, 8 byte input, 1 byte LED output). */
+-    private val KEYBOARD_DESCRIPTOR = bytes(
+-      0x05, 0x01,       // Usage Page (Generic Desktop)
+-      0x09, 0x06,       // Usage (Keyboard)
+-      0xA1, 0x01,       // Collection (Application)
+-      0x85, REPORT_ID,  //   Report ID
+-      0x05, 0x07,       //   Usage Page (Key Codes)
+-      0x19, 0xE0,       //   Usage Minimum (Left Control)
+-      0x29, 0xE7,       //   Usage Maximum (Right GUI)
+-      0x15, 0x00,       //   Logical Minimum (0)
+-      0x25, 0x01,       //   Logical Maximum (1)
+-      0x75, 0x01,       //   Report Size (1)
+-      0x95, 0x08,       //   Report Count (8)
+-      0x81, 0x02,       //   Input (Data, Variable, Absolute): modifier byte
+-      0x95, 0x01,       //   Report Count (1)
+-      0x75, 0x08,       //   Report Size (8)
+-      0x81, 0x01,       //   Input (Constant): reserved byte
+-      0x95, 0x05,       //   Report Count (5)
+-      0x75, 0x01,       //   Report Size (1)
+-      0x05, 0x08,       //   Usage Page (LEDs)
+-      0x19, 0x01,       //   Usage Minimum (Num Lock)
+-      0x29, 0x05,       //   Usage Maximum (Kana)
+-      0x91, 0x02,       //   Output (Data, Variable, Absolute): LED report
+-      0x95, 0x01,       //   Report Count (1)
+-      0x75, 0x03,       //   Report Size (3)
+-      0x91, 0x01,       //   Output (Constant): LED padding
+-      0x95, 0x06,       //   Report Count (6)
+-      0x75, 0x08,       //   Report Size (8)
+-      0x15, 0x00,       //   Logical Minimum (0)
+-      0x25, 0x65,       //   Logical Maximum (101)
+-      0x05, 0x07,       //   Usage Page (Key Codes)
+-      0x19, 0x00,       //   Usage Minimum (0)
+-      0x29, 0x65,       //   Usage Maximum (101)
+-      0x81, 0x00,       //   Input (Data, Array): 6 key slots
+-      0xC0,             // End Collection
+-    )
+   }
+ }
+diff --git a/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidSupport.kt b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidSupport.kt
+new file mode 100644
+index 0000000..93054d5
+--- /dev/null
++++ b/modules/bluetooth-hid/android/src/main/java/expo/modules/bluetoothhid/HidSupport.kt
+@@ -0,0 +1,75 @@
++package expo.modules.bluetoothhid
++
++import android.annotation.SuppressLint
++import android.bluetooth.BluetoothAdapter
++import android.bluetooth.BluetoothClass
++import android.bluetooth.BluetoothDevice
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** Dipakai bersama oleh mode HID klasik (HidKeyboard) dan mode BLE (BleHidKeyboard). */
++internal object HidDescriptor {
++  const val REPORT_ID = 1
++
++  private fun bytes(vararg values: Int) = ByteArray(values.size) { values[it].toByte() }
++
++  /** HID report descriptor keyboard standar (report ID 1, 8 byte input, 1 byte LED output). */
++  val KEYBOARD: ByteArray = bytes(
++    0x05, 0x01,       // Usage Page (Generic Desktop)
++    0x09, 0x06,       // Usage (Keyboard)
++    0xA1, 0x01,       // Collection (Application)
++    0x85, REPORT_ID,  //   Report ID
++    0x05, 0x07,       //   Usage Page (Key Codes)
++    0x19, 0xE0,       //   Usage Minimum (Left Control)
++    0x29, 0xE7,       //   Usage Maximum (Right GUI)
++    0x15, 0x00,       //   Logical Minimum (0)
++    0x25, 0x01,       //   Logical Maximum (1)
++    0x75, 0x01,       //   Report Size (1)
++    0x95, 0x08,       //   Report Count (8)
++    0x81, 0x02,       //   Input (Data, Variable, Absolute): modifier byte
++    0x95, 0x01,       //   Report Count (1)
++    0x75, 0x08,       //   Report Size (8)
++    0x81, 0x01,       //   Input (Constant): reserved byte
++    0x95, 0x05,       //   Report Count (5)
++    0x75, 0x01,       //   Report Size (1)
++    0x05, 0x08,       //   Usage Page (LEDs)
++    0x19, 0x01,       //   Usage Minimum (Num Lock)
++    0x29, 0x05,       //   Usage Maximum (Kana)
++    0x91, 0x02,       //   Output (Data, Variable, Absolute): LED report
++    0x95, 0x01,       //   Report Count (1)
++    0x75, 0x03,       //   Report Size (3)
++    0x91, 0x01,       //   Output (Constant): LED padding
++    0x95, 0x06,       //   Report Count (6)
++    0x75, 0x08,       //   Report Size (8)
++    0x15, 0x00,       //   Logical Minimum (0)
++    0x25, 0x65,       //   Logical Maximum (101)
++    0x05, 0x07,       //   Usage Page (Key Codes)
++    0x19, 0x00,       //   Usage Minimum (0)
++    0x29, 0x65,       //   Usage Maximum (101)
++    0x81, 0x00,       //   Input (Data, Array): 6 key slots
++    0xC0,             // End Collection
++  )
++}
++
++/** Daftar perangkat yang sudah dipasangkan, dalam bentuk JSON array. */
++@SuppressLint("MissingPermission")
++internal fun bondedDevicesJson(adapter: BluetoothAdapter?): String {
++  val result = JSONArray()
++  val bonded: Set<BluetoothDevice> = try {
++    adapter?.bondedDevices ?: emptySet()
++  } catch (e: SecurityException) {
++    emptySet()
++  }
++
++  for (device in bonded) {
++    val isComputer =
++      device.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
++    result.put(
++      JSONObject()
++        .put("name", device.name ?: device.address)
++        .put("address", device.address)
++        .put("isComputer", isComputer),
++    )
++  }
++  return result.toString()
++}
+diff --git a/modules/bluetooth-hid/src/BluetoothHid.types.ts b/modules/bluetooth-hid/src/BluetoothHid.types.ts
+index 6e0580e..9cd49e3 100644
+--- a/modules/bluetooth-hid/src/BluetoothHid.types.ts
++++ b/modules/bluetooth-hid/src/BluetoothHid.types.ts
+@@ -1,9 +1,22 @@
+ export type HidStatus = 'stopped' | 'starting' | 'ready' | 'connecting' | 'connected' | 'failed';
+ 
+-export type StartResult = 'ok' | 'unsupported' | 'no_bluetooth' | 'bluetooth_off' | 'failed';
++export type StartResult =
++  | 'ok'
++  | 'unsupported'
++  | 'no_bluetooth'
++  | 'bluetooth_off'
++  | 'permission'
++  | 'failed';
++
++/** Cara HP tampil sebagai keyboard: HID klasik (Android 9+) atau BLE (HID over GATT). */
++export type HidTransport = 'classic' | 'ble';
++
++/** auto: coba klasik dulu, pindah ke BLE kalau gagal. */
++export type StartMode = 'auto' | 'classic' | 'ble';
+ 
+ export type StateChangeEvent = {
+   status: HidStatus;
++  transport: HidTransport;
+   deviceName: string | null;
+   deviceAddress: string | null;
+ };
+diff --git a/modules/bluetooth-hid/src/BluetoothHidModule.ts b/modules/bluetooth-hid/src/BluetoothHidModule.ts
+index 83ab22e..f1ae1af 100644
+--- a/modules/bluetooth-hid/src/BluetoothHidModule.ts
++++ b/modules/bluetooth-hid/src/BluetoothHidModule.ts
+@@ -1,10 +1,10 @@
+ import { NativeModule, requireOptionalNativeModule } from 'expo';
+ 
+-import { BluetoothHidModuleEvents, StartResult } from './BluetoothHid.types';
++import { BluetoothHidModuleEvents, StartMode, StartResult } from './BluetoothHid.types';
+ 
+ declare class BluetoothHidModule extends NativeModule<BluetoothHidModuleEvents> {
+   isSupported(): boolean;
+-  start(): StartResult;
++  start(mode: StartMode): StartResult;
+   stop(): void;
+   /** JSON array of PairedDevice. */
+   getPairedDevices(): string;
+diff --git a/modules/bluetooth-hid/src/index.ts b/modules/bluetooth-hid/src/index.ts
+index b5ad8aa..a523783 100644
+--- a/modules/bluetooth-hid/src/index.ts
++++ b/modules/bluetooth-hid/src/index.ts
+@@ -1,15 +1,18 @@
+ import type { EventSubscription } from 'expo';
+ 
+-import type { PairedDevice, StartResult, StateChangeEvent } from './BluetoothHid.types';
++import type { PairedDevice, StartMode, StartResult, StateChangeEvent } from './BluetoothHid.types';
+ import NativeBluetoothHid from './BluetoothHidModule';
+ 
+ export type * from './BluetoothHid.types';
+ 
+-/** True only on Android 9+ devices that have Bluetooth. */
++/** False when the native module is not in the build, for example when running in Expo Go. */
++export const isModuleLoaded: boolean = NativeBluetoothHid != null;
++
++/** True on devices that have Bluetooth and support classic HID (Android 9+) or BLE peripheral. */
+ export const isAvailable: boolean = NativeBluetoothHid?.isSupported() ?? false;
+ 
+-export function start(): StartResult {
+-  return NativeBluetoothHid?.start() ?? 'unsupported';
++export function start(mode: StartMode = 'auto'): StartResult {
++  return NativeBluetoothHid?.start(mode) ?? 'unsupported';
+ }
+ 
+ export function stop(): void {
+diff --git a/src/app/index.tsx b/src/app/index.tsx
+index de525b7..8d6f804 100644
+--- a/src/app/index.tsx
++++ b/src/app/index.tsx
+@@ -44,7 +44,10 @@ const STATUS_COLOR: Record<BluetoothHid.HidStatus, string> = {
+ };
+ 
+ const ERRORS = {
+-  unsupported: 'HP ini tidak mendukung mode keyboard Bluetooth. Dibutuhkan Android 9 atau lebih baru.',
++  unsupported:
++    'HP ini tidak mendukung mode keyboard Bluetooth, baik lewat HID klasik (Android 9 atau lebih baru) maupun BLE.',
++  moduleMissing:
++    'Modul Bluetooth tidak ada di aplikasi ini. Jangan buka lewat Expo Go. Build dengan npx expo run:android (atau pasang APK hasil build), lalu buka ulang aplikasi.',
+   no_bluetooth: 'Bluetooth tidak tersedia di perangkat ini.',
+   bluetooth_off: 'Bluetooth mati. Nyalakan Bluetooth, lalu ketuk Coba lagi.',
+   failed:
+@@ -55,12 +58,18 @@ const ERRORS = {
+   discoverable: 'Tidak bisa membuka pengaturan visibilitas Bluetooth.',
+ } as const;
+ 
++const UNSUPPORTED = BluetoothHid.isModuleLoaded ? ERRORS.unsupported : ERRORS.moduleMissing;
++
++/** HID klasik baru ada sejak Android 9 (API 28). Di bawah itu hanya BLE. */
++const CLASSIC_POSSIBLE = Platform.OS === 'android' && Platform.Version >= 28;
++
+ export default function KeyboardScreen() {
+   const theme = useTheme();
+   const [status, setStatus] = useState<BluetoothHid.HidStatus>('stopped');
+   const [deviceName, setDeviceName] = useState<string | null>(null);
++  const [transport, setTransport] = useState<BluetoothHid.HidTransport>('classic');
+   const [error, setError] = useState<string | null>(
+-    BluetoothHid.isAvailable ? null : ERRORS.unsupported,
++    BluetoothHid.isAvailable ? null : UNSUPPORTED,
+   );
+   const [devices, setDevices] = useState<BluetoothHid.PairedDevice[]>([]);
+   const [text, setText] = useState('');
+@@ -76,10 +85,10 @@ export default function KeyboardScreen() {
+     setDevices(list);
+   }, []);
+ 
+-  const setup = useCallback(async () => {
++  const setup = useCallback(async (mode: BluetoothHid.StartMode = 'auto') => {
+     setError(null);
+     if (!BluetoothHid.isAvailable) {
+-      setError(ERRORS.unsupported);
++      setError(UNSUPPORTED);
+       return;
+     }
+ 
+@@ -95,7 +104,7 @@ export default function KeyboardScreen() {
+       }
+     }
+ 
+-    const result = BluetoothHid.start();
++    const result = BluetoothHid.start(mode);
+     if (result !== 'ok') setError(ERRORS[result]);
+     refreshDevices();
+   }, [refreshDevices]);
+@@ -104,6 +113,7 @@ export default function KeyboardScreen() {
+     const subscription = BluetoothHid.addStateListener((event) => {
+       setStatus(event.status);
+       setDeviceName(event.deviceName);
++      setTransport(event.transport);
+ 
+       if (event.status === 'failed') setError(ERRORS.failed);
+       else if (event.status !== 'stopped') setError(null);
+@@ -180,7 +190,7 @@ export default function KeyboardScreen() {
+           {error && (
+             <ThemedView type="backgroundElement" style={styles.notice}>
+               <ThemedText type="small">{error}</ThemedText>
+-              {canRetry && <Button label="Coba lagi" variant="secondary" onPress={setup} />}
++              {canRetry && <Button label="Coba lagi" variant="secondary" onPress={() => void setup()} />}
+             </ThemedView>
+           )}
+ 
+@@ -214,16 +224,35 @@ export default function KeyboardScreen() {
+               keyboardShouldPersistTaps="handled">
+               <ThemedView type="backgroundElement" style={styles.card}>
+                 <ThemedText type="smallBold">Pairing pertama kali</ThemedText>
+-                <ThemedText type="small" themeColor="textSecondary">
+-                  1. Ketuk tombol di bawah supaya HP terlihat oleh laptop.{'\n'}
+-                  2. Di laptop, buka pengaturan Bluetooth lalu pasangkan dengan HP ini.{'\n'}
+-                  3. Kalau belum tersambung otomatis, pilih laptop dari daftar di bawah.
+-                </ThemedText>
+-                <Button
+-                  label="Tampilkan HP ke laptop"
+-                  onPress={showToLaptop}
+-                  disabled={status !== 'ready' && status !== 'connecting'}
+-                />
++                {transport === 'ble' ? (
++                  <ThemedText type="small" themeColor="textSecondary">
++                    Mode BLE aktif, HP sudah terlihat oleh laptop.{'\n'}
++                    1. Di Windows, buka Pengaturan, Bluetooth & perangkat, Tambah perangkat,
++                    Bluetooth.{'\n'}
++                    2. Pilih nama HP ini, lalu setujui kode pairing di HP dan di laptop.{'\n'}
++                    Kalau pairing gagal, hapus HP ini dari daftar perangkat Windows lalu ulangi.
++                  </ThemedText>
++                ) : (
++                  <>
++                    <ThemedText type="small" themeColor="textSecondary">
++                      1. Ketuk tombol di bawah supaya HP terlihat oleh laptop.{'\n'}
++                      2. Di laptop, buka pengaturan Bluetooth lalu pasangkan dengan HP ini.{'\n'}
++                      3. Kalau belum tersambung otomatis, pilih laptop dari daftar di bawah.
++                    </ThemedText>
++                    <Button
++                      label="Tampilkan HP ke laptop"
++                      onPress={showToLaptop}
++                      disabled={status !== 'ready' && status !== 'connecting'}
++                    />
++                  </>
++                )}
++                {BluetoothHid.isAvailable && (transport === 'ble' ? CLASSIC_POSSIBLE : true) && (
++                  <Button
++                    label={transport === 'ble' ? 'Coba mode klasik' : 'Coba mode BLE'}
++                    variant="secondary"
++                    onPress={() => void setup(transport === 'ble' ? 'classic' : 'ble')}
++                  />
++                )}
+               </ThemedView>
+ 
+               <View style={styles.listHeader}>

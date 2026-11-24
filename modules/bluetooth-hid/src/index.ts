@@ -1,15 +1,18 @@
 import type { EventSubscription } from 'expo';
 
-import type { PairedDevice, StartResult, StateChangeEvent } from './BluetoothHid.types';
+import type { PairedDevice, StartMode, StartResult, StateChangeEvent } from './BluetoothHid.types';
 import NativeBluetoothHid from './BluetoothHidModule';
 
 export type * from './BluetoothHid.types';
 
-/** True only on Android 9+ devices that have Bluetooth. */
+/** False when the native module is not in the build, for example when running in Expo Go. */
+export const isModuleLoaded: boolean = NativeBluetoothHid != null;
+
+/** True on devices that have Bluetooth and support classic HID (Android 9+) or BLE peripheral. */
 export const isAvailable: boolean = NativeBluetoothHid?.isSupported() ?? false;
 
-export function start(): StartResult {
-  return NativeBluetoothHid?.start() ?? 'unsupported';
+export function start(mode: StartMode = 'auto'): StartResult {
+  return NativeBluetoothHid?.start(mode) ?? 'unsupported';
 }
 
 export function stop(): void {

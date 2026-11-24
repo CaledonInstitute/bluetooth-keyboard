@@ -44,7 +44,10 @@ const STATUS_COLOR: Record<BluetoothHid.HidStatus, string> = {
 };
 
 const ERRORS = {
-  unsupported: 'HP ini tidak mendukung mode keyboard Bluetooth. Dibutuhkan Android 9 atau lebih baru.',
+  unsupported:
+    'HP ini tidak mendukung mode keyboard Bluetooth, baik lewat HID klasik (Android 9 atau lebih baru) maupun BLE.',
+  moduleMissing:
+    'Modul Bluetooth tidak ada di aplikasi ini. Jangan buka lewat Expo Go. Build dengan npx expo run:android (atau pasang APK hasil build), lalu buka ulang aplikasi.',
   no_bluetooth: 'Bluetooth tidak tersedia di perangkat ini.',
   bluetooth_off: 'Bluetooth mati. Nyalakan Bluetooth, lalu ketuk Coba lagi.',
   failed:
@@ -55,12 +58,18 @@ const ERRORS = {
   discoverable: 'Tidak bisa membuka pengaturan visibilitas Bluetooth.',
 } as const;
 
+const UNSUPPORTED = BluetoothHid.isModuleLoaded ? ERRORS.unsupported : ERRORS.moduleMissing;
+
+/** HID klasik baru ada sejak Android 9 (API 28). Di bawah itu hanya BLE. */
+const CLASSIC_POSSIBLE = Platform.OS === 'android' && Platform.Version >= 28;
+
 export default function KeyboardScreen() {
   const theme = useTheme();
   const [status, setStatus] = useState<BluetoothHid.HidStatus>('stopped');
   const [deviceName, setDeviceName] = useState<string | null>(null);
+  const [transport, setTransport] = useState<BluetoothHid.HidTransport>('classic');
   const [error, setError] = useState<string | null>(
-    BluetoothHid.isAvailable ? null : ERRORS.unsupported,
+    BluetoothHid.isAvailable ? null : UNSUPPORTED,
   );
   const [devices, setDevices] = useState<BluetoothHid.PairedDevice[]>([]);
   const [text, setText] = useState('');
@@ -76,10 +85,10 @@ export default function KeyboardScreen() {
     setDevices(list);
   }, []);
 
-  const setup = useCallback(async () => {
+  const setup = useCallback(async (mode: BluetoothHid.StartMode = 'auto') => {
     setError(null);
     if (!BluetoothHid.isAvailable) {
-      setError(ERRORS.unsupported);
+      setError(UNSUPPORTED);
       return;
     }
 
@@ -95,7 +104,7 @@ export default function KeyboardScreen() {
       }
     }
 
-    const result = BluetoothHid.start();
+    const result = BluetoothHid.start(mode);
     if (result !== 'ok') setError(ERRORS[result]);
     refreshDevices();
   }, [refreshDevices]);
@@ -104,6 +113,7 @@ export default function KeyboardScreen() {
     const subscription = BluetoothHid.addStateListener((event) => {
       setStatus(event.status);
       setDeviceName(event.deviceName);
+      setTransport(event.transport);
 
       if (event.status === 'failed') setError(ERRORS.failed);
       else if (event.status !== 'stopped') setError(null);
@@ -180,7 +190,7 @@ export default function KeyboardScreen() {
           {error && (
             <ThemedView type="backgroundElement" style={styles.notice}>
               <ThemedText type="small">{error}</ThemedText>
-              {canRetry && <Button label="Coba lagi" variant="secondary" onPress={setup} />}
+              {canRetry && <Button label="Coba lagi" variant="secondary" onPress={() => void setup()} />}
             </ThemedView>
           )}
 
@@ -214,16 +224,35 @@ export default function KeyboardScreen() {
               keyboardShouldPersistTaps="handled">
               <ThemedView type="backgroundElement" style={styles.card}>
                 <ThemedText type="smallBold">Pairing pertama kali</ThemedText>
-                <ThemedText type="small" themeColor="textSecondary">
-                  1. Ketuk tombol di bawah supaya HP terlihat oleh laptop.{'\n'}
-                  2. Di laptop, buka pengaturan Bluetooth lalu pasangkan dengan HP ini.{'\n'}
-                  3. Kalau belum tersambung otomatis, pilih laptop dari daftar di bawah.
-                </ThemedText>
-                <Button
-                  label="Tampilkan HP ke laptop"
-                  onPress={showToLaptop}
-                  disabled={status !== 'ready' && status !== 'connecting'}
-                />
+                {transport === 'ble' ? (
+                  <ThemedText type="small" themeColor="textSecondary">
+                    Mode BLE aktif, HP sudah terlihat oleh laptop.{'\n'}
+                    1. Di Windows, buka Pengaturan, Bluetooth & perangkat, Tambah perangkat,
+                    Bluetooth.{'\n'}
+                    2. Pilih nama HP ini, lalu setujui kode pairing di HP dan di laptop.{'\n'}
+                    Kalau pairing gagal, hapus HP ini dari daftar perangkat Windows lalu ulangi.
+                  </ThemedText>
+                ) : (
+                  <>
+                    <ThemedText type="small" themeColor="textSecondary">
+                      1. Ketuk tombol di bawah supaya HP terlihat oleh laptop.{'\n'}
+                      2. Di laptop, buka pengaturan Bluetooth lalu pasangkan dengan HP ini.{'\n'}
+                      3. Kalau belum tersambung otomatis, pilih laptop dari daftar di bawah.
+                    </ThemedText>
+                    <Button
+                      label="Tampilkan HP ke laptop"
+                      onPress={showToLaptop}
+                      disabled={status !== 'ready' && status !== 'connecting'}
+                    />
+                  </>
+                )}
+                {BluetoothHid.isAvailable && (transport === 'ble' ? CLASSIC_POSSIBLE : true) && (
+                  <Button
+                    label={transport === 'ble' ? 'Coba mode klasik' : 'Coba mode BLE'}
+                    variant="secondary"
+                    onPress={() => void setup(transport === 'ble' ? 'classic' : 'ble')}
+                  />
+                )}
               </ThemedView>
 
               <View style={styles.listHeader}>

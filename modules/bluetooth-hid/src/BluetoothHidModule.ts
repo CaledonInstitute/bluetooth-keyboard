@@ -1,10 +1,10 @@
 import { NativeModule, requireOptionalNativeModule } from 'expo';
 
-import { BluetoothHidModuleEvents, StartResult } from './BluetoothHid.types';
+import { BluetoothHidModuleEvents, StartMode, StartResult } from './BluetoothHid.types';
 
 declare class BluetoothHidModule extends NativeModule<BluetoothHidModuleEvents> {
   isSupported(): boolean;
-  start(): StartResult;
+  start(mode: StartMode): StartResult;
   stop(): void;
   /** JSON array of PairedDevice. */
   getPairedDevices(): string;
